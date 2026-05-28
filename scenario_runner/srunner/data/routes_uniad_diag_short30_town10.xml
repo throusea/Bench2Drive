@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+   <route id="0" town="Town10HD_Opt">
+      <waypoints>
+         <position x="-22.000" y="-43.000" z="0.0"/>
+         <position x="-5.000" y="-51.000" z="0.0"/>
+         <position x="12.700" y="-57.400" z="0.0"/>
+      </waypoints>
+      <scenarios>
+         <scenario name="UniADDiagShort30Placeholder_1" type="ControlLoss">
+            <trigger_point x="9999.0" y="9999.0" z="0.0" yaw="0.0"/>
+         </scenario>
+      </scenarios>
+   </route>
+</routes>

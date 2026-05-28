@@ -22,7 +22,7 @@ from leaderboard.envs.sensor_interface import CallBack, OpenDriveMapReader, Spee
 from leaderboard.autoagents.autonomous_agent import Track
 from leaderboard.autoagents.ros_base_agent import ROSBaseAgent
 
-IS_BENCH2DRIVE = os.environ.get('SAVE_PATH', None)
+IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 if IS_BENCH2DRIVE:
     MAX_ALLOWED_RADIUS_SENSOR = 100.0  # for visualize
 else:

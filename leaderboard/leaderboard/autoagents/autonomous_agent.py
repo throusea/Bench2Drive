@@ -9,6 +9,7 @@ This module provides the base class for all autonomous agents
 
 from __future__ import print_function
 
+import os
 from enum import Enum
 
 import carla
@@ -113,8 +114,9 @@ class AutonomousAgent(object):
         wallclock_diff = (wallclock - self.wallclock_t0).total_seconds()
         sim_ratio = 0 if wallclock_diff == 0 else timestamp/wallclock_diff
 
-        print('=== [Agent] -- Wallclock = {} -- System time = {} -- Game time = {} -- Ratio = {}x'.format(
-            str(wallclock)[:-3], format(wallclock_diff, '.3f'), format(timestamp, '.3f'), format(sim_ratio, '.3f')), flush=True)
+        if os.environ.get('B2D_VERBOSE_AGENT_TIMING'):
+            print('=== [Agent] -- Wallclock = {} -- System time = {} -- Game time = {} -- Ratio = {}x'.format(
+                str(wallclock)[:-3], format(wallclock_diff, '.3f'), format(timestamp, '.3f'), format(sim_ratio, '.3f')), flush=True)
 
         control = self.run_step(input_data, timestamp)
         control.manual_gear_shift = False

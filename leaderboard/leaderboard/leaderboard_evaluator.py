@@ -15,10 +15,9 @@ from __future__ import print_function
 import traceback
 import argparse
 from argparse import RawTextHelpFormatter
-from distutils.version import LooseVersion
 import importlib
+from importlib.metadata import version as package_version
 import os
-import pkg_resources
 import sys
 import carla
 import signal
@@ -110,10 +109,13 @@ class LeaderboardEvaluator(object):
         # Setup the simulation
         self.client, self.client_timeout, self.traffic_manager = self._setup_simulation(args)
 
-        dist = pkg_resources.get_distribution("carla")
-        if dist.version != 'leaderboard':
-            if LooseVersion(dist.version) < LooseVersion('0.9.10'):
-                raise ImportError("CARLA version 0.9.10.1 or newer required. CARLA version found: {}".format(dist))
+        carla_version = package_version("carla")
+        if carla_version != 'leaderboard':
+            version_tuple = tuple(int(part) for part in carla_version.split('.')[:3])
+            if version_tuple < (0, 9, 10):
+                raise ImportError(
+                    "CARLA version 0.9.10.1 or newer required. CARLA version found: {}".format(carla_version)
+                )
 
         # Load agent
         module_name = os.path.basename(args.agent).split('.')[0]
@@ -189,22 +191,33 @@ class LeaderboardEvaluator(object):
             self.manager.cleanup()
 
         # Make sure no sensors are left streaming
-        alive_sensors = self.world.get_actors().filter('*sensor*')
-        for sensor in alive_sensors:
-            sensor.stop()
-            sensor.destroy()
+        if self.world:
+            alive_sensors = self.world.get_actors().filter('*sensor*')
+            for sensor in alive_sensors:
+                sensor.stop()
+                sensor.destroy()
 
     def _setup_simulation(self, args):
         """
         Prepares the simulation by getting the client, and setting up the world and traffic manager settings
         """
         self.carla_path = os.environ["CARLA_ROOT"]
-        args.port = find_free_port(args.port)
-        cmd1 = f"{os.path.join(self.carla_path, 'CarlaUE4.sh')} -RenderOffScreen -nosound -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
-        self.server = subprocess.Popen(cmd1, shell=True, preexec_fn=os.setsid)
-        print(cmd1, self.server.returncode, flush=True)
-        atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
-        time.sleep(30)
+        self.server = None
+        if not args.external_server:
+            args.port = find_free_port(args.port)
+            executable = "CarlaUE4.exe" if os.name == "nt" else "CarlaUE4.sh"
+            cmd1 = (
+                f"\"{os.path.join(self.carla_path, executable)}\" "
+                f"-RenderOffScreen -nosound -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
+            )
+            popen_kwargs = {"shell": True}
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = os.setsid
+            self.server = subprocess.Popen(cmd1, **popen_kwargs)
+            print(cmd1, self.server.returncode, flush=True)
+            if os.name != "nt":
+                atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
+            time.sleep(30)
             
         attempts = 0
         num_max_restarts = 20
@@ -497,7 +510,7 @@ class LeaderboardEvaluator(object):
             self.statistics_manager.compute_global_statistics()
             self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, crashed)
         
-        if crashed:
+        if crashed and not args.external_server and os.name != "nt":
             cmd2 = "ps -ef | grep '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
             server = subprocess.Popen(cmd2, shell=True, preexec_fn=os.setsid)
             atexit.register(os.killpg, server.pid, signal.SIGKILL)
@@ -547,6 +560,8 @@ def main():
     parser.add_argument("--debug-checkpoint", type=str, default='./live_results.txt',
                         help="Path to checkpoint used for saving live results")
     parser.add_argument("--gpu-rank", type=int, default=0)
+    parser.add_argument("--external-server", action="store_true",
+                        help="Connect to an already running CARLA server instead of launching one.")
     arguments = parser.parse_args()
 
     statistics_manager = StatisticsManager(arguments.checkpoint, arguments.debug_checkpoint)

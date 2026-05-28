@@ -1,1 +1,5 @@
 __pycache__/
+
+# Local leaderboard evaluator outputs
+leaderboard_results/*
+!leaderboard_results/.gitkeep
