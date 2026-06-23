@@ -185,6 +185,10 @@ class Accident(BasicScenario):
         second_actor.apply_control(carla.VehicleControl(hand_brake=True))
         self.other_actors.append(second_actor)
 
+        CarlaDataProvider.active_scenarios.append(
+            (type(self).__name__, [police_car, second_actor, self._direction, False, 1e9, 1e9, False])
+        )
+
     def _create_behavior(self):
         """
         The vehicle has to drive the reach a specific point but an accident is in the middle of the road,
@@ -391,6 +395,12 @@ class ParkedObstacle(BasicScenario):
 
         self._end_wp = self._move_waypoint_forward(self._vehicle_wp, self._end_distance)
 
+        side_lane_wp = self._vehicle_wp.get_left_lane() if self._direction == 'right' else self._vehicle_wp.get_right_lane()
+        scenario_name = 'ParkedObstacle' if side_lane_wp.lane_id * self._vehicle_wp.lane_id > 0 else 'ParkedObstacleTwoWays'
+        CarlaDataProvider.active_scenarios.append(
+            (scenario_name, [parked_actor, None, self._direction, False, 1e9, 1e9, False])
+        )
+
     def _create_behavior(self):
         """
         The vehicle has to drive the whole predetermined distance.
@@ -587,6 +597,10 @@ class HazardAtSideLane(BasicScenario):
         # Set its initial conditions
         bicycle_2.apply_control(carla.VehicleControl(hand_brake=True))
         self.other_actors.append(bicycle_2)
+
+        CarlaDataProvider.active_scenarios.append(
+            (type(self).__name__, [bicycle_1, bicycle_2, False, 1e9, 1e9, False])
+        )
 
     def _create_behavior(self):
         """

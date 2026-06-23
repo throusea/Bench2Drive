@@ -70,6 +70,7 @@ class CrossingBicycleFlow(BasicScenario):
         self.timeout = timeout
 
         self._start_flow = convert_dict_to_location(config.other_parameters['start_actor_flow'])
+        self._end_flow = convert_dict_to_location(config.other_parameters['end_actor_flow'])
         self._end_dist_flow = 40  # m
         self._sink_distance = 2
 
@@ -130,6 +131,21 @@ class CrossingBicycleFlow(BasicScenario):
                 exit_loc = wp.transform.location
             elif plan_step == 2 and exit_loc.distance(wp.transform.location) > self._end_dist_flow:
                 break
+
+        CarlaDataProvider.active_scenarios.append((
+            type(self).__name__,
+            [
+                None,
+                None,
+                {
+                    "start_x": float(self._start_flow.x),
+                    "start_y": float(self._start_flow.y),
+                    "end_x": float(self._end_flow.x),
+                    "end_y": float(self._end_flow.y),
+                    "flow_speed": float(self._flow_speed),
+                },
+            ],
+        ))
 
         tls = self._world.get_traffic_lights_in_junction(junction.id)
         if not tls:

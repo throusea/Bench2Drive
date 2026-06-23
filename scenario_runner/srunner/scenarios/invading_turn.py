@@ -109,6 +109,10 @@ class InvadingTurn(BasicScenario):
 
         self._create_obstacle()
 
+        first_cone = self._obstacle_transforms[0][0]
+        last_cone = self._obstacle_transforms[-1][0]
+        CarlaDataProvider.active_scenarios.append((type(self).__name__, [first_cone, last_cone, self._true_offset]))
+
     def _create_obstacle(self):
 
         next_wp = self._source_wp.next(10)[0]

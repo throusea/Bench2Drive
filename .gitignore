@@ -3,3 +3,10 @@ __pycache__/
 # Local leaderboard evaluator outputs
 leaderboard_results/*
 !leaderboard_results/.gitkeep
+
+# Local downloaded benchmark data
+Bench2Drive-mini/
+
+# Runtime junction created by the carla_garage compatibility runner.
+# The real reference code lives under the parent workspace docs/reference tree.
+team_code/

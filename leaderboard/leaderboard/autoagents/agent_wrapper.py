@@ -131,14 +131,15 @@ class AgentWrapper(object):
     """
     Wrapper for autonomous agents required for tracking and checking of used sensors
     """
-    _agent = None
-    _sensors_list = []
+    _pooled_sensor_ids = set()
+    _sensor_pool = {}
 
     def __init__(self, agent):
         """
         Set the autonomous agent
         """
         self._agent = agent
+        self._sensors_list = []
 
     def __call__(self):
         """
@@ -166,6 +167,11 @@ class AgentWrapper(object):
             attributes['image_size_x'] = str(sensor_spec['width'])
             attributes['image_size_y'] = str(sensor_spec['height'])
             attributes['fov'] = str(sensor_spec['fov'])
+            self._copy_optional_sensor_attributes(
+                sensor_spec,
+                attributes,
+                ['sensor_tick', 'enable_postprocess_effects', 'motion_blur_intensity']
+            )
 
             sensor_location = carla.Location(x=sensor_spec['x'], y=sensor_spec['y'],
                                              z=sensor_spec['z'])
@@ -184,6 +190,23 @@ class AgentWrapper(object):
             attributes['dropoff_general_rate'] = str(0.45)
             attributes['dropoff_intensity_limit'] = str(0.8)
             attributes['dropoff_zero_intensity'] = str(0.4)
+            self._copy_optional_sensor_attributes(
+                sensor_spec,
+                attributes,
+                [
+                    'sensor_tick',
+                    'range',
+                    'rotation_frequency',
+                    'channels',
+                    'upper_fov',
+                    'lower_fov',
+                    'points_per_second',
+                    'atmosphere_attenuation_rate',
+                    'dropoff_general_rate',
+                    'dropoff_intensity_limit',
+                    'dropoff_zero_intensity',
+                ]
+            )
 
             sensor_location = carla.Location(x=sensor_spec['x'], y=sensor_spec['y'],
                                              z=sensor_spec['z'])
@@ -196,6 +219,11 @@ class AgentWrapper(object):
             attributes['vertical_fov'] = str(sensor_spec['vertical_fov'])  # degrees
             attributes['points_per_second'] = '1500'
             attributes['range'] = '100'  # meters
+            self._copy_optional_sensor_attributes(
+                sensor_spec,
+                attributes,
+                ['sensor_tick', 'points_per_second', 'range']
+            )
 
             sensor_location = carla.Location(x=sensor_spec['x'],
                                              y=sensor_spec['y'],
@@ -235,6 +263,15 @@ class AgentWrapper(object):
 
         return type_, id_, sensor_transform, attributes
 
+    @staticmethod
+    def _copy_optional_sensor_attributes(sensor_spec, attributes, names):
+        for name in names:
+            if name in sensor_spec:
+                value = sensor_spec[name]
+                if isinstance(value, bool):
+                    value = str(value).lower()
+                attributes[name] = str(value)
+
     def setup_sensors(self, vehicle):
         """
         Create the sensors defined by the user and attach them to the ego-vehicle
@@ -243,43 +280,209 @@ class AgentWrapper(object):
         """
         world = CarlaDataProvider.get_world()
         bp_library = world.get_blueprint_library()
-        for sensor_spec in self._agent.sensors():
-            type_, id_, sensor_transform, attributes = self._preprocess_sensor_spec(sensor_spec)
+        reuse_lead_rig = self._reuse_lead_rig_enabled()
+        reuse_lead_sensors = self._reuse_lead_sensors_enabled()
+        sensor_specs = self._agent.sensors()
+        pool_key = None
+        pooled_sensors = {}
+        if reuse_lead_rig:
+            if reuse_lead_sensors:
+                pool_key = self._sensor_pool_key(world, vehicle, sensor_specs)
+                pooled_sensors = self._sensor_pool.get(pool_key, {})
+            print(
+                f"lead_rig_pool setup vehicle_id={vehicle.id} key={pool_key} "
+                f"pooled={len(pooled_sensors)} sensor_pool={'on' if reuse_lead_sensors else 'off'}",
+                flush=True
+            )
+        try:
+            for sensor_spec in sensor_specs:
+                type_, id_, sensor_transform, attributes = self._preprocess_sensor_spec(sensor_spec)
 
-            # These are the pseudosensors (not spawned)
-            if type_ == 'sensor.opendrive_map':
-                sensor = OpenDriveMapReader(vehicle, attributes['reading_frequency'])
-            elif type_ == 'sensor.speedometer':
-                sensor = SpeedometerReader(vehicle, attributes['reading_frequency'])
+                # These are the pseudosensors (not spawned)
+                if type_ == 'sensor.opendrive_map':
+                    sensor = OpenDriveMapReader(vehicle, attributes['reading_frequency'])
+                elif type_ == 'sensor.speedometer':
+                    sensor = SpeedometerReader(vehicle, attributes['reading_frequency'])
 
-            # These are the sensors spawned on the carla world
-            else:
-                bp = bp_library.find(type_)
-                for key, value in attributes.items():
-                    bp.set_attribute(str(key), str(value))
-                sensor = CarlaDataProvider.get_world().spawn_actor(bp, sensor_transform, vehicle)
+                # These are the sensors spawned on the carla world
+                else:
+                    sensor = None
+                    if reuse_lead_sensors and id_ in pooled_sensors:
+                        candidate = pooled_sensors[id_]
+                        if (
+                            candidate is not None
+                            and candidate.is_alive
+                            and self._sensor_attached_to_vehicle(candidate, vehicle)
+                        ):
+                            sensor = candidate
+                            print(f"lead_rig_pool reuse sensor id={id_} actor_id={sensor.id}", flush=True)
+                        else:
+                            self._discard_pooled_sensor(candidate)
+                            pooled_sensors.pop(id_, None)
+                    if sensor is None:
+                        bp = bp_library.find(type_)
+                        for key, value in attributes.items():
+                            bp.set_attribute(str(key), str(value))
+                        sensor = CarlaDataProvider.get_world().spawn_actor(bp, sensor_transform, vehicle)
+                        if reuse_lead_sensors:
+                            pooled_sensors[id_] = sensor
+                            self._pooled_sensor_ids.add(sensor.id)
+                            print(f"lead_rig_pool spawn sensor id={id_} actor_id={sensor.id}", flush=True)
 
-            # setup callback
-            sensor.listen(CallBack(id_, type_, sensor, self._agent.sensor_interface))
-            self._sensors_list.append(sensor)
+                # setup callback
+                sensor.listen(CallBack(id_, type_, sensor, self._agent.sensor_interface))
+                self._sensors_list.append(sensor)
 
-        # Some sensors miss sending data during the first ticks, so tick several times and remove the data
-        for _ in range(10):
-            world.tick()
+            if reuse_lead_sensors and pool_key is not None:
+                self._sensor_pool[pool_key] = pooled_sensors
 
-    def cleanup(self):
+            # Some sensors miss sending data during the first ticks, so tick several times and remove the data
+            for _ in range(10):
+                world.tick()
+        except Exception:
+            self.cleanup(force_destroy_pooled=True)
+            raise
+
+    def cleanup(self, force_destroy_pooled=False):
         """
         Remove and destroy all sensors
         """
+        world = CarlaDataProvider.get_world()
+        reuse_lead_sensors = self._reuse_lead_sensors_enabled()
         for i, _ in enumerate(self._sensors_list):
             if self._sensors_list[i] is not None:
-                self._sensors_list[i].stop()
-                self._sensors_list[i].destroy()
+                try:
+                    self._sensors_list[i].stop()
+                except RuntimeError:
+                    pass
+
+        # Give CARLA one frame to drain pending sensor callbacks before destroying
+        # actors. This avoids UE render-thread crashes when camera streams are torn
+        # down during route cleanup or interruption.
+        if world:
+            try:
+                world.tick()
+            except RuntimeError:
+                pass
+
+        for i, _ in enumerate(self._sensors_list):
+            if self._sensors_list[i] is not None:
+                if (
+                    reuse_lead_sensors
+                    and not force_destroy_pooled
+                    and self._is_pooled_sensor(self._sensors_list[i])
+                ):
+                    print(
+                        f"lead_rig_pool keep sensor actor_id={self._sensors_list[i].id}",
+                        flush=True
+                    )
+                else:
+                    self._discard_pooled_sensor(self._sensors_list[i])
+                    try:
+                        self._sensors_list[i].destroy()
+                    except RuntimeError:
+                        pass
                 self._sensors_list[i] = None
         self._sensors_list = []
 
         # Tick once to destroy the sensors
-        CarlaDataProvider.get_world().tick()
+        if world:
+            try:
+                world.tick()
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _reuse_lead_rig_enabled():
+        return (
+            os.environ.get('B2D_REUSE_LEAD_RIG', '').strip().lower() in ('1', 'true', 'yes', 'on')
+            and os.environ.get('B2D_AGENT_KIND', '').strip().lower() == 'lead'
+        )
+
+    @classmethod
+    def _reuse_lead_sensors_enabled(cls):
+        return (
+            cls._reuse_lead_rig_enabled()
+            and os.environ.get('B2D_REUSE_LEAD_SENSORS', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        )
+
+    @classmethod
+    def _normalize_sensor_value(cls, value):
+        if isinstance(value, dict):
+            return tuple(
+                sorted(
+                    (str(key), cls._normalize_sensor_value(val))
+                    for key, val in value.items()
+                )
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(cls._normalize_sensor_value(item) for item in value)
+        return value
+
+    @classmethod
+    def _sensor_signature(cls, sensor_specs):
+        signature = []
+        for sensor in sensor_specs:
+            if sensor.get('type') in ('sensor.opendrive_map', 'sensor.speedometer'):
+                continue
+            signature.append(tuple(
+                sorted(
+                    (str(key), cls._normalize_sensor_value(value))
+                    for key, value in sensor.items()
+                )
+            ))
+        return tuple(sorted(signature))
+
+    @classmethod
+    def _sensor_pool_key(cls, world, vehicle, sensor_specs):
+        town = world.get_map().name.split('/')[-1]
+        return (town, vehicle.id, cls._sensor_signature(sensor_specs))
+
+    @classmethod
+    def _is_pooled_sensor(cls, sensor):
+        try:
+            actor_id = getattr(sensor, 'id', None)
+            return actor_id is not None and actor_id in cls._pooled_sensor_ids
+        except RuntimeError:
+            return False
+
+    @classmethod
+    def is_pooled_sensor_actor_id(cls, actor_id):
+        return actor_id in cls._pooled_sensor_ids
+
+    @staticmethod
+    def _sensor_attached_to_vehicle(sensor, vehicle):
+        try:
+            parent = getattr(sensor, 'parent', None)
+            return parent is not None and parent.id == vehicle.id
+        except RuntimeError:
+            return False
+
+    @classmethod
+    def _discard_pooled_sensor(cls, sensor):
+        if sensor is None:
+            return
+        try:
+            actor_id = getattr(sensor, 'id', None)
+        except RuntimeError:
+            actor_id = None
+        if actor_id is None:
+            return
+
+        cls._pooled_sensor_ids.discard(actor_id)
+        empty_keys = []
+        for pool_key, sensors in cls._sensor_pool.items():
+            for sensor_id, pooled_sensor in list(sensors.items()):
+                try:
+                    pooled_actor_id = getattr(pooled_sensor, 'id', None)
+                except RuntimeError:
+                    pooled_actor_id = None
+                if pooled_actor_id == actor_id:
+                    sensors.pop(sensor_id, None)
+            if not sensors:
+                empty_keys.append(pool_key)
+        for pool_key in empty_keys:
+            cls._sensor_pool.pop(pool_key, None)
 
 
 class ROSAgentWrapper(AgentWrapper):

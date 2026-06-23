@@ -107,6 +107,10 @@ class YieldToEmergencyVehicle(BasicScenario):
 
         self.other_actors.append(actor)
 
+        CarlaDataProvider.active_scenarios.append(
+            (type(self).__name__, [actor, None, False, 1e9, 1e9, False])
+        )
+
     def _create_behavior(self):
         """
         Spawn the EV behind and wait for it to be close-by. After it has approached,

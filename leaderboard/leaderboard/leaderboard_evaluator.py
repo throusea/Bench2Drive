@@ -29,7 +29,7 @@ from srunner.scenariomanager.watchdog import Watchdog
 from leaderboard.scenarios.scenario_manager import ScenarioManager
 from leaderboard.scenarios.route_scenario import RouteScenario
 from leaderboard.envs.sensor_interface import SensorConfigurationInvalid
-from leaderboard.autoagents.agent_wrapper import AgentError, validate_sensor_configuration, TickRuntimeError
+from leaderboard.autoagents.agent_wrapper import AgentWrapper, AgentError, validate_sensor_configuration, TickRuntimeError
 from leaderboard.utils.statistics_manager import StatisticsManager, FAILURE_MESSAGES
 from leaderboard.utils.route_indexer import RouteIndexer
 import atexit
@@ -167,10 +167,18 @@ class LeaderboardEvaluator(object):
         """
         Remove and destroy all actors
         """
-        CarlaDataProvider.cleanup()
-
         if self._agent_watchdog:
             self._agent_watchdog.stop()
+
+        if self.manager:
+            self._client_timed_out = not self.manager.get_running_status()
+            try:
+                if getattr(self.manager, "_agent_wrapper", None) is not None:
+                    self.manager._agent_wrapper.cleanup()
+                    self.manager._agent_wrapper = None
+            except Exception:
+                print("\n\033[91mFailed to cleanup agent sensors:", flush=True)
+                print(f"\n{traceback.format_exc()}\033[0m", flush=True)
 
         try:
             if self.agent_instance:
@@ -187,15 +195,80 @@ class LeaderboardEvaluator(object):
                 self.statistics_manager.remove_scenario()
 
         if self.manager:
-            self._client_timed_out = not self.manager.get_running_status()
             self.manager.cleanup()
 
         # Make sure no sensors are left streaming
         if self.world:
             alive_sensors = self.world.get_actors().filter('*sensor*')
             for sensor in alive_sensors:
-                sensor.stop()
-                sensor.destroy()
+                if self._reuse_lead_rig_enabled() and AgentWrapper.is_pooled_sensor_actor_id(sensor.id):
+                    continue
+                try:
+                    sensor.stop()
+                except RuntimeError:
+                    pass
+            try:
+                self.world.tick()
+            except RuntimeError:
+                pass
+            for sensor in alive_sensors:
+                if self._reuse_lead_rig_enabled() and AgentWrapper.is_pooled_sensor_actor_id(sensor.id):
+                    continue
+                try:
+                    sensor.destroy()
+                except RuntimeError:
+                    pass
+
+        CarlaDataProvider.cleanup()
+
+    def _cleanup_reused_world_actors(self):
+        """
+        Destroy leftover actors from an interrupted route before reusing the same CARLA world.
+        """
+        if not self.world:
+            return
+
+        destroy_commands = []
+        actor_filters = [
+            "*sensor*",
+            "*vehicle*",
+            "*walker*",
+            "*controller.ai.walker*",
+            "static.prop.*",
+        ]
+        seen_actor_ids = set()
+        for actor_filter in actor_filters:
+            for actor in self.world.get_actors().filter(actor_filter):
+                if actor.id in seen_actor_ids:
+                    continue
+                seen_actor_ids.add(actor.id)
+                if self._reuse_lead_rig_enabled():
+                    if actor_filter == "*sensor*" and AgentWrapper.is_pooled_sensor_actor_id(actor.id):
+                        continue
+                    if actor_filter == "*vehicle*" and actor.attributes.get("role_name") == "hero":
+                        continue
+                if actor_filter == "*sensor*":
+                    try:
+                        actor.stop()
+                    except RuntimeError:
+                        pass
+                destroy_commands.append(carla.command.DestroyActor(actor))
+
+        if destroy_commands:
+            print(f"world_actor_cleanup count={len(destroy_commands)}", flush=True)
+            try:
+                self.world.tick()
+            except RuntimeError:
+                pass
+            self.client.apply_batch_sync(destroy_commands, True)
+            self.world.tick()
+
+    @staticmethod
+    def _reuse_lead_rig_enabled():
+        return (
+            os.environ.get("B2D_REUSE_LEAD_RIG", "").strip().lower() in ("1", "true", "yes", "on")
+            and os.environ.get("B2D_AGENT_KIND", "").strip().lower() == "lead"
+        )
 
     def _setup_simulation(self, args):
         """
@@ -282,7 +355,24 @@ class LeaderboardEvaluator(object):
         """
         Load a new CARLA world without changing the settings and provide data to CarlaDataProvider
         """
-        self.world = self.client.load_world(town, reset_settings=False)
+        current_town = None
+        if self.world is None:
+            try:
+                self.world = self.client.get_world()
+            except Exception:
+                self.world = None
+
+        if self.world is not None:
+            try:
+                current_town = self.world.get_map().name.split("/")[-1]
+            except Exception:
+                current_town = None
+
+        if current_town == town:
+            print(f"world_reuse town={town}", flush=True)
+        else:
+            print(f"world_load requested_town={town} current_town={current_town}", flush=True)
+            self.world = self.client.load_world(town, reset_settings=False)
 
         # Large Map settings are always reset, for some reason
         settings = self.world.get_settings()
@@ -305,6 +395,7 @@ class LeaderboardEvaluator(object):
         if map_name != town:
             raise Exception("The CARLA server uses the wrong map!"
                             " This scenario requires the use of map {}".format(town))
+        print(f"world_ready town={town}", flush=True)
 
     def _register_statistics(self, route_index, entry_status, crash_message=""):
         """
@@ -327,6 +418,7 @@ class LeaderboardEvaluator(object):
         entry_status = "Started"
 
         print("\n\033[1m========= Preparing {} (repetition {}) =========\033[0m".format(config.name, config.repetition_index), flush=True)
+        print(f"route_start index={config.index} name={config.name} town={config.town}", flush=True)
 
         # Prepare the statistics of the route
         route_name = f"{config.name}_rep{config.repetition_index}"
@@ -343,6 +435,14 @@ class LeaderboardEvaluator(object):
         # Load the world and the scenario
         try:
             self._load_and_wait_for_world(args, config.town)
+            self._cleanup_reused_world_actors()
+            if hasattr(CarlaDataProvider, "active_scenarios"):
+                CarlaDataProvider.active_scenarios = []
+            CarlaDataProvider._actor_velocity_map.clear()
+            CarlaDataProvider._actor_location_map.clear()
+            CarlaDataProvider._actor_transform_map.clear()
+            CarlaDataProvider._carla_actor_pool = {}
+            CarlaDataProvider._all_actors = None
             self.route_scenario = RouteScenario(world=self.world, config=config, debug_mode=args.debug)
             self.statistics_manager.set_scenario(self.route_scenario)
 
@@ -354,6 +454,7 @@ class LeaderboardEvaluator(object):
             entry_status, crash_message = FAILURE_MESSAGES["Simulation"]
             self._register_statistics(config.index, entry_status, crash_message)
             self._cleanup()
+            print(f"route_end index={config.index} name={config.name} town={config.town} status=load_failed", flush=True)
             return True
 
         print("\033[1m> Setting up the agent\033[0m", flush=True)
@@ -400,6 +501,7 @@ class LeaderboardEvaluator(object):
             entry_status, crash_message = FAILURE_MESSAGES["Sensors"]
             self._register_statistics(config.index, entry_status, crash_message)
             self._cleanup()
+            print(f"route_end index={config.index} name={config.name} town={config.town} status=sensor_invalid", flush=True)
             return True
 
         except Exception as e:
@@ -411,6 +513,7 @@ class LeaderboardEvaluator(object):
             entry_status, crash_message = FAILURE_MESSAGES["Agent_init"]
             self._register_statistics(config.index, entry_status, crash_message)
             self._cleanup()
+            print(f"route_end index={config.index} name={config.name} town={config.town} status=agent_init_failed", flush=True)
             return True
 
         print("\033[1m> Running the route\033[0m", flush=True)
@@ -435,7 +538,7 @@ class LeaderboardEvaluator(object):
             return True
         
         except TickRuntimeError:
-            entry_status, crash_message = "Started", "TickRuntime"
+            entry_status, crash_message = "Started", "Agent timed out"
         
         except Exception:
             print("\n\033[91mError during the simulation:", flush=True)
@@ -453,12 +556,15 @@ class LeaderboardEvaluator(object):
                 self.client.stop_recorder()
 
             self._cleanup()
+            end_status = "crashed" if crash_message else "completed"
+            print(f"route_end index={config.index} name={config.name} town={config.town} status={end_status}", flush=True)
 
         except Exception:
             print("\n\033[91mFailed to stop the scenario, the statistics might be empty:", flush=True)
             print(f"\n{traceback.format_exc()}\033[0m", flush=True)
 
             _, crash_message = FAILURE_MESSAGES["Simulation"]
+            print(f"route_end index={config.index} name={config.name} town={config.town} status=stop_failed", flush=True)
 
         # If the simulation crashed, stop the leaderboard, for the rest, move to the next route
         return crash_message == "Simulation crashed"
@@ -467,55 +573,61 @@ class LeaderboardEvaluator(object):
         """
         Run the challenge mode
         """
-        route_indexer = RouteIndexer(args.routes, args.repetitions, args.routes_subset)
-
-        if args.resume:
-            resume = route_indexer.validate_and_resume(args.checkpoint)
-        else:
-            resume = False
-
-        if resume:
-            self.statistics_manager.add_file_records(args.checkpoint)
-        else:
-            self.statistics_manager.clear_records()
-        self.statistics_manager.save_progress(route_indexer.index, route_indexer.total)
-        self.statistics_manager.write_statistics()
-
         crashed = False
-        t1 = time.time()
-        while route_indexer.peek() and not crashed:
+        try:
+            route_indexer = RouteIndexer(args.routes, args.repetitions, args.routes_subset)
 
-            # Run the scenario
-            config = route_indexer.get_next_config()
-            crashed = self._load_and_run_scenario(args, config)
-            print(crashed, flush=True)
-            # Save the progress and write the route statistics
+            if args.resume:
+                resume = route_indexer.validate_and_resume(args.checkpoint)
+            else:
+                resume = False
+
+            if resume:
+                self.statistics_manager.add_file_records(args.checkpoint)
+            else:
+                self.statistics_manager.clear_records()
             self.statistics_manager.save_progress(route_indexer.index, route_indexer.total)
             self.statistics_manager.write_statistics()
-            if crashed:
-                print(f'{route_indexer.index} crash, [{route_indexer.index}/{route_indexer.total}], please restart', flush=True)
-                break
 
-        # Shutdown ROS1 bridge server if necessary
-        if self._ros1_server is not None:
-            self._ros1_server.shutdown()
+            t1 = time.time()
+            while route_indexer.peek() and not crashed:
 
-        # Go back to asynchronous mode
-        self._reset_world_settings()
+                # Run the scenario
+                config = route_indexer.get_next_config()
+                crashed = self._load_and_run_scenario(args, config)
+                print(crashed, flush=True)
+                # Save the progress and write the route statistics
+                self.statistics_manager.save_progress(route_indexer.index, route_indexer.total)
+                self.statistics_manager.write_statistics()
+                if crashed:
+                    print(f'{route_indexer.index} crash, [{route_indexer.index}/{route_indexer.total}], please restart', flush=True)
+                    break
 
-        if not crashed:
-            # Save global statistics
-            print(f"cost time={time.time()-t1}", flush=True)
-            print("\033[1m> Registering the global statistics\033[0m", flush=True)
-            self.statistics_manager.compute_global_statistics()
-            self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, crashed)
-        
-        if crashed and not args.external_server and os.name != "nt":
-            cmd2 = "ps -ef | grep '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
-            server = subprocess.Popen(cmd2, shell=True, preexec_fn=os.setsid)
-            atexit.register(os.killpg, server.pid, signal.SIGKILL)
+            # Shutdown ROS1 bridge server if necessary
+            if self._ros1_server is not None:
+                self._ros1_server.shutdown()
 
-        return crashed
+            if not crashed:
+                # Save global statistics
+                print(f"cost time={time.time()-t1}", flush=True)
+                print("\033[1m> Registering the global statistics\033[0m", flush=True)
+                self.statistics_manager.compute_global_statistics()
+                self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, crashed)
+
+            if crashed and not args.external_server and os.name != "nt":
+                cmd2 = "ps -ef | grep '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
+                server = subprocess.Popen(cmd2, shell=True, preexec_fn=os.setsid)
+                atexit.register(os.killpg, server.pid, signal.SIGKILL)
+
+            return crashed
+        finally:
+            # External CARLA servers persist across runs, so always leave the
+            # simulator in async mode when this evaluator exits normally.
+            try:
+                self._reset_world_settings()
+            except Exception:
+                print("\n\033[91mFailed to reset CARLA world settings:", flush=True)
+                print(f"\n{traceback.format_exc()}\033[0m", flush=True)
 
 def main():
     description = "CARLA AD Leaderboard Evaluation: evaluate your Agent in CARLA scenarios\n"

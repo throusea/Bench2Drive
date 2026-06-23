@@ -13,6 +13,7 @@ local buffers to avoid blocking calls to CARLA
 from __future__ import print_function
 
 import math
+import os
 import re
 import threading
 from numpy import random
@@ -47,6 +48,9 @@ class CarlaDataProvider(object):  # pylint: disable=too-many-public-methods
 
     In addition it provides access to the map and the transform of all traffic lights
     """
+
+    # Scenario metadata consumed by privileged agents such as carla_garage AutoPilot.
+    active_scenarios = []
 
     _actor_velocity_map = {}
     _actor_location_map = {}
@@ -852,6 +856,13 @@ class CarlaDataProvider(object):  # pylint: disable=too-many-public-methods
         for actor_id in CarlaDataProvider._carla_actor_pool.copy():
             actor = CarlaDataProvider._carla_actor_pool[actor_id]
             if actor is not None and actor.is_alive:
+                if (
+                    os.environ.get('B2D_REUSE_LEAD_RIG', '').strip().lower() in ('1', 'true', 'yes', 'on')
+                    and os.environ.get('B2D_AGENT_KIND', '').strip().lower() == 'lead'
+                    and actor.attributes.get('role_name') == 'hero'
+                ):
+                    print(f"lead_rig_pool preserve hero actor_id={actor.id}", flush=True)
+                    continue
                 batch.append(DestroyActor(actor))
 
         if CarlaDataProvider._client:
@@ -867,6 +878,7 @@ class CarlaDataProvider(object):  # pylint: disable=too-many-public-methods
         CarlaDataProvider._actor_location_map.clear()
         CarlaDataProvider._actor_transform_map.clear()
         CarlaDataProvider._traffic_light_map.clear()
+        CarlaDataProvider.active_scenarios = []
         CarlaDataProvider._map = None
         CarlaDataProvider._world = None
         CarlaDataProvider._sync_flag = False

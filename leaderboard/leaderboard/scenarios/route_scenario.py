@@ -146,6 +146,10 @@ class RouteScenario(BasicScenario):
         elevate_transform = self.route[0][0]
         elevate_transform.location.z += 0.5
 
+        ego_vehicle = self._reuse_ego_vehicle(elevate_transform)
+        if ego_vehicle:
+            return ego_vehicle
+
         ego_vehicle = CarlaDataProvider.request_new_actor('vehicle.lincoln.mkz_2020',
                                                           elevate_transform,
                                                           rolename='hero')
@@ -159,6 +163,59 @@ class RouteScenario(BasicScenario):
         self.world.tick()
 
         return ego_vehicle
+
+    def _reuse_ego_vehicle(self, transform):
+        if not self._reuse_lead_rig_enabled():
+            return None
+
+        for actor in self.world.get_actors().filter('vehicle.*'):
+            if (
+                actor.is_alive
+                and actor.attributes.get('role_name') == 'hero'
+                and actor.type_id == 'vehicle.lincoln.mkz_2020'
+            ):
+                print(f"lead_rig_pool reuse hero actor_id={actor.id}", flush=True)
+                self._reset_ego_actor(actor, transform)
+                CarlaDataProvider._carla_actor_pool[actor.id] = actor
+                CarlaDataProvider.register_actor(actor, transform)
+                spectator = self.world.get_spectator()
+                spectator.set_transform(carla.Transform(transform.location + carla.Location(z=50),
+                                                        carla.Rotation(pitch=-90)))
+                self.world.tick()
+                return actor
+        return None
+
+    def _reset_ego_actor(self, actor, transform):
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+        except RuntimeError:
+            pass
+        for method_name, value in (
+            ('set_target_velocity', carla.Vector3D(0.0, 0.0, 0.0)),
+            ('set_target_angular_velocity', carla.Vector3D(0.0, 0.0, 0.0)),
+        ):
+            try:
+                getattr(actor, method_name)(value)
+            except (AttributeError, RuntimeError):
+                pass
+        try:
+            actor.set_simulate_physics(False)
+            actor.set_transform(transform)
+            self.world.tick()
+            actor.set_simulate_physics(True)
+        except RuntimeError:
+            pass
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _reuse_lead_rig_enabled():
+        return (
+            os.environ.get('B2D_REUSE_LEAD_RIG', '').strip().lower() in ('1', 'true', 'yes', 'on')
+            and os.environ.get('B2D_AGENT_KIND', '').strip().lower() == 'lead'
+        )
 
     def _get_parking_slots(self, max_distance=100, route_step=10):
         """Spawn parked vehicles."""

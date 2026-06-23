@@ -13,6 +13,7 @@ It must not be modified and is for reference only!
 from __future__ import print_function
 import signal
 import sys
+import os
 import time
 
 import py_trees
@@ -54,6 +55,7 @@ class ScenarioManager(object):
         self.scenario_tree = None
         self.ego_vehicles = None
         self.other_actors = None
+        self.max_tick_count = int(os.environ.get("B2D_MAX_TICK_COUNT", "0") or "0")
 
         self._debug_mode = debug_mode
         self._agent_wrapper = None
@@ -179,8 +181,11 @@ class ScenarioManager(object):
             self.tick_count += 1
             self._watchdog.pause()
 
-            if self.tick_count > 4000:
-                raise TickRuntimeError("RuntimeError, tick_count > 4000")
+            if self.max_tick_count > 0 and self.tick_count > self.max_tick_count:
+                raise TickRuntimeError(
+                    f"Route simulation time limit exceeded: "
+                    f"tick_count={self.tick_count} max_tick_count={self.max_tick_count}"
+                )
 
             try:
                 self._agent_watchdog.resume()
