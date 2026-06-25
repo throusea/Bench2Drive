@@ -73,6 +73,7 @@ class ScenarioManager(object):
         self._watchdog = None
         self._agent_watchdog = None
         self._scenario_thread = None
+        self._carla_rpc_lock = threading.RLock()
 
         self._statistics_manager = statistics_manager
 
@@ -133,9 +134,13 @@ class ScenarioManager(object):
         Keep periodically trying to start the scenarios that are close to the ego vehicle
         Additionally, do the same for the spawned vehicles
         """
+        # Let the main loop own the first synchronous tick. CARLA's Python
+        # client is not safe when actor-spawn RPC and world.tick race.
+        time.sleep(1)
         while self._running:
-            self.scenario.build_scenarios(self.ego_vehicles[0], debug=debug)
-            self.scenario.spawn_parked_vehicles(self.ego_vehicles[0])
+            with self._carla_rpc_lock:
+                self.scenario.build_scenarios(self.ego_vehicles[0], debug=debug)
+                self.scenario.spawn_parked_vehicles(self.ego_vehicles[0])
             time.sleep(1)
 
     def run_scenario(self):
@@ -166,8 +171,19 @@ class ScenarioManager(object):
         """
         Run next tick of scenario and the agent and tick the world.
         """
+        diagnostics = os.environ.get("B2D_TICK_DIAGNOSTICS") == "1"
         if self._running and self.get_running_status():
-            CarlaDataProvider.get_world().tick(self._timeout)
+            if diagnostics and self.tick_count < 3:
+                settings = CarlaDataProvider.get_world().get_settings()
+                print(
+                    f"tick_before count={self.tick_count} sync={settings.synchronous_mode} "
+                    f"fixed_delta={settings.fixed_delta_seconds}",
+                    flush=True,
+                )
+            with self._carla_rpc_lock:
+                frame = CarlaDataProvider.get_world().tick(self._timeout)
+            if diagnostics and self.tick_count < 3:
+                print(f"tick_after count={self.tick_count} frame={frame}", flush=True)
 
         timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp
 
@@ -188,10 +204,14 @@ class ScenarioManager(object):
                 )
 
             try:
+                if diagnostics and self.tick_count <= 3:
+                    print(f"agent_step_before count={self.tick_count}", flush=True)
                 self._agent_watchdog.resume()
                 self._agent_watchdog.update()
                 ego_action = self._agent_wrapper()
                 self._agent_watchdog.pause()
+                if diagnostics and self.tick_count <= 3:
+                    print(f"agent_step_after count={self.tick_count}", flush=True)
 
             # Special exception inside the agent that isn't caused by the agent
             except SensorReceivedNoData as e:

@@ -285,6 +285,7 @@ class AgentWrapper(object):
         sensor_specs = self._agent.sensors()
         pool_key = None
         pooled_sensors = {}
+        diagnostics = os.environ.get("B2D_TICK_DIAGNOSTICS") == "1"
         if reuse_lead_rig:
             if reuse_lead_sensors:
                 pool_key = self._sensor_pool_key(world, vehicle, sensor_specs)
@@ -297,6 +298,8 @@ class AgentWrapper(object):
         try:
             for sensor_spec in sensor_specs:
                 type_, id_, sensor_transform, attributes = self._preprocess_sensor_spec(sensor_spec)
+                if diagnostics:
+                    print(f"sensor_setup_before id={id_} type={type_}", flush=True)
 
                 # These are the pseudosensors (not spawned)
                 if type_ == 'sensor.opendrive_map':
@@ -332,13 +335,28 @@ class AgentWrapper(object):
                 # setup callback
                 sensor.listen(CallBack(id_, type_, sensor, self._agent.sensor_interface))
                 self._sensors_list.append(sensor)
+                if diagnostics:
+                    actor_id = getattr(sensor, "id", "pseudo")
+                    print(f"sensor_setup_after id={id_} type={type_} actor_id={actor_id}", flush=True)
 
             if reuse_lead_sensors and pool_key is not None:
                 self._sensor_pool[pool_key] = pooled_sensors
 
-            # Some sensors miss sending data during the first ticks, so tick several times and remove the data
-            for _ in range(10):
-                world.tick()
+            # A few frames are enough to prime callbacks. More warm-up ticks can
+            # block while large-map tiles are streaming on Windows CARLA.
+            warmup_ticks = max(1, int(os.environ.get("B2D_SENSOR_WARMUP_TICKS", "5")))
+            for warmup_tick in range(warmup_ticks):
+                if diagnostics:
+                    print(
+                        f"sensor_warmup_before tick={warmup_tick + 1}/{warmup_ticks}",
+                        flush=True,
+                    )
+                frame = world.tick()
+                if diagnostics:
+                    print(
+                        f"sensor_warmup_after tick={warmup_tick + 1}/{warmup_ticks} frame={frame}",
+                        flush=True,
+                    )
         except Exception:
             self.cleanup(force_destroy_pooled=True)
             raise

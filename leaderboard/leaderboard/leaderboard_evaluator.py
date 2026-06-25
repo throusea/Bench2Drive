@@ -50,6 +50,8 @@ sensors_to_icons = {
 
 import socket
 
+from b2d_lab.carla_runtime import enforce_synchronous_mode
+
 def find_free_port(starting_port):
     port = starting_port
     while True:
@@ -374,11 +376,9 @@ class LeaderboardEvaluator(object):
             print(f"world_load requested_town={town} current_town={current_town}", flush=True)
             self.world = self.client.load_world(town, reset_settings=False)
 
-        # Large Map settings are always reset, for some reason
-        settings = self.world.get_settings()
-        settings.tile_stream_distance = 650
-        settings.actor_active_distance = 650
-        self.world.apply_settings(settings)
+        # World loading can reset synchronous and large-map settings even when
+        # reset_settings=False. Reapply them and verify the readback before ticking.
+        enforce_synchronous_mode(self.world, self.traffic_manager, self.frame_rate)
 
         self.world.reset_all_traffic_lights()
         CarlaDataProvider.set_client(self.client)
